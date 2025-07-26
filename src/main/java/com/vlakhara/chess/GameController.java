@@ -24,7 +24,6 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.AtomicInteger;
 import java.util.concurrent.ConcurrentHashMap;
 
 @Component
@@ -272,13 +271,13 @@ public class GameController extends TextWebSocketHandler {
                 logger.info("After removal - Games count: {}", games.size());
                 
                 // Clean up any remaining session references for this game
-                final AtomicInteger removedSessions = new AtomicInteger(0);
+                final int[] removedSessions = {0};
                 sessionsWithGame.entrySet().removeIf(entry -> {
                     boolean shouldRemove = gameId.equals(entry.getValue());
-                    if (shouldRemove) removedSessions.incrementAndGet();
+                    if (shouldRemove) removedSessions[0]++;
                     return shouldRemove;
                 });
-                logger.info("Removed {} session references for game: {}", removedSessions.get(), gameId);
+                logger.info("Removed {} session references for game: {}", removedSessions[0], gameId);
                 
                 // Log the current state after cleanup
                 logGameState();
