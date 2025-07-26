@@ -116,6 +116,7 @@ public class GameController extends TextWebSocketHandler {
             );
 
             games.put(gameId, game);
+            logger.info("New game created: " + gameId + " with white player: " + userName);
 
             sendMessage(session, "SELF_JOIN", Map.of(
                     "game", new GameDTO(game),
@@ -140,7 +141,8 @@ public class GameController extends TextWebSocketHandler {
                     "player", game.getWhite()
             ));
 
-        System.out.println(games);
+            logger.info("Game " + gameId + " is now full with black player: " + userName);
+            logGameState();
         } else {
             session.sendMessage(new TextMessage("❌ Game is already full"));
         }
@@ -164,6 +166,14 @@ public class GameController extends TextWebSocketHandler {
         return games.get(id);
     }
 
+    public boolean isGameAvailable(String gameId) {
+        Game game = findGameById(gameId);
+        if (game == null) {
+            return true; // Game doesn't exist, so it's available
+        }
+        return game.getBlack() == null; // Game exists but black player hasn't joined
+    }
+
     private String generateUniqueId() {
         return UUID.randomUUID().toString().replace("-", "").substring(0, 8);
     }
@@ -176,27 +186,52 @@ public class GameController extends TextWebSocketHandler {
         }
     }
 
+    private void logGameState() {
+        logger.info("Current games state:");
+        logger.info("Active games: " + games.size());
+        logger.info("Active sessions: " + sessionsWithGame.size());
+        games.forEach((gameId, game) -> {
+            logger.info("Game " + gameId + ": " + 
+                       "White session: " + (game.getWhiteSession() != null ? "active" : "null") + 
+                       ", Black session: " + (game.getBlackSession() != null ? "active" : "null") +
+                       ", Status: " + game.getStatus());
+        });
+    }
+
     @Override
     public void afterConnectionClosed(WebSocketSession session, CloseStatus status) throws Exception {
         System.out.println("Client disconnected: " + session.getId());
 
         String sessionId = session.getId();
-        logger.info(sessionId);
+        logger.info("Session disconnected: " + sessionId);
         String gameId = sessionsWithGame.remove(sessionId);
-        logger.info(gameId);
+        logger.info("Game ID for disconnected session: " + gameId);
+        
         if (gameId == null) return;
 
         Game game = findGameById(gameId);
-        if (game == null) return;
+        if (game == null) {
+            logger.info("Game not found for ID: " + gameId);
+            return;
+        }
 
         boolean isWhite = game.getWhiteSession() != null && sessionId.equals(game.getWhiteSession().getId());
         boolean isBlack = game.getBlackSession() != null && sessionId.equals(game.getBlackSession().getId());
 
-        if (!isWhite && !isBlack) return;
+        if (!isWhite && !isBlack) {
+            logger.info("Session not associated with any player in game: " + gameId);
+            return;
+        }
 
         // Mark session as disconnected
-        if (isWhite) game.setWhiteSession(null);
-        if (isBlack) game.setBlackSession(null);
+        if (isWhite) {
+            game.setWhiteSession(null);
+            logger.info("White player disconnected from game: " + gameId);
+        }
+        if (isBlack) {
+            game.setBlackSession(null);
+            logger.info("Black player disconnected from game: " + gameId);
+        }
 
         // Determine opponent
         Player winner = isWhite ? game.getBlack() : game.getWhite();
@@ -206,7 +241,7 @@ public class GameController extends TextWebSocketHandler {
         if (game.getWinner() == null && winner != null) {
             game.setStatus(GameStatus.RESIGNED);
             game.setWinner(winner);
-            logger.info(winner.toString());
+            logger.info("Game ended by resignation. Winner: " + winner.toString());
 
             if (winnerSession != null && winnerSession.isOpen()) {
                 sendMessage(winnerSession, "MOVED", Map.of("game", new GameDTO(game)));
@@ -214,8 +249,16 @@ public class GameController extends TextWebSocketHandler {
             }
         }
 
+        // Check if both players have disconnected
         if (game.getWhiteSession() == null && game.getBlackSession() == null) {
+            logger.info("Both players disconnected, removing game: " + gameId);
             games.remove(gameId);
+            
+            // Clean up any remaining session references for this game
+            sessionsWithGame.entrySet().removeIf(entry -> gameId.equals(entry.getValue()));
+            
+            // Log the current state after cleanup
+            logGameState();
         }
     }
 }
