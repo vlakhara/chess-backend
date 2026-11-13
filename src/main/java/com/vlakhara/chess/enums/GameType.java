@@ -8,5 +8,7 @@ public enum GameType {
     PING,
     DRAW_OFFER,
     DRAW_RESPONSE,
-    LEAVE
+    LEAVE,
+    REJOIN,
+    REMATCH
 }

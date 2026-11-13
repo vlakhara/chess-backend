@@ -2,6 +2,7 @@ package com.vlakhara.chess;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.vlakhara.chess.dto.GameDTO;
@@ -21,10 +22,16 @@ import org.springframework.web.socket.handler.TextWebSocketHandler;
 
 import java.io.IOException;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 
 @Component
 public class GameController extends TextWebSocketHandler {
@@ -33,6 +40,45 @@ public class GameController extends TextWebSocketHandler {
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final Map<String, Game> games = new ConcurrentHashMap<>();
     private final Map<String, String> sessionsWithGame = new ConcurrentHashMap<>();
+
+    /** Per-game extras the Game entity does not carry: move log, clock, tokens, timers. */
+    private final Map<String, GameState> states = new ConcurrentHashMap<>();
+    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "chess-timers");
+        t.setDaemon(true);
+        return t;
+    });
+    /** How long a dropped player has to come back before forfeiting. */
+    private final long graceMs = Long.getLong("chess.graceMs", 60_000L);
+
+    static class GameState {
+        String whiteToken;
+        String blackToken;
+        final List<JsonNode> moves = new ArrayList<>();
+        long baseMs;
+        long incMs;
+        long whiteMs;
+        long blackMs;
+        long lastTick;
+        boolean running;
+        ScheduledFuture<?> flag;
+        ScheduledFuture<?> graceWhite;
+        ScheduledFuture<?> graceBlack;
+        boolean whiteRematch;
+        boolean blackRematch;
+
+        boolean timed() { return baseMs > 0; }
+
+        String turn() { return moves.size() % 2 == 0 ? "white" : "black"; }
+
+        void resetClock() {
+            whiteMs = baseMs;
+            blackMs = baseMs;
+            running = false;
+            lastTick = 0;
+            if (flag != null) { flag.cancel(false); flag = null; }
+        }
+    }
 
     @Autowired
     private BoardService boardService;
@@ -91,6 +137,12 @@ public class GameController extends TextWebSocketHandler {
                         break;
                     case JOIN:
                         join(session, payload);
+                        break;
+                    case REJOIN:
+                        rejoin(session, payload);
+                        break;
+                    case REMATCH:
+                        rematch(session, payload);
                         break;
                     default:
                         logger.warn("Unknown game type: {} from session {}", rawType, session.getId());
@@ -152,12 +204,17 @@ public class GameController extends TextWebSocketHandler {
             );
 
             games.put(gameId, game);
+
+            GameState st = new GameState();
+            st.whiteToken = newToken();
+            JsonNode tc = payload.path("timeControl");
+            st.baseMs = clamp(tc.path("base").asLong(0), 0, 7200) * 1000L;
+            st.incMs = st.baseMs > 0 ? clamp(tc.path("inc").asLong(0), 0, 60) * 1000L : 0;
+            st.resetClock();
+            states.put(gameId, st);
             logger.info("New game created: " + gameId + " with white player: " + userName);
 
-            sendMessage(session, "SELF_JOIN", Map.of(
-                    "game", new GameDTO(game),
-                    "player", player
-            ));
+            sendMessage(session, "SELF_JOIN", joinPayload(game, st, player, st.whiteToken));
 
         } else if (game.getBlack() == null) {
             // Second player
@@ -167,15 +224,11 @@ public class GameController extends TextWebSocketHandler {
             game.setStatus(GameStatus.IN_PROGRESS);
             sessionsWithGame.put(session.getId(), gameId);
 
-            sendMessage(session, "SELF_JOIN", Map.of(
-                    "game", new GameDTO(game),
-                    "player", player
-            ));
+            GameState st = states.get(gameId);
+            st.blackToken = newToken();
 
-            sendMessage(game.getWhiteSession(), "OPPONENT_JOINED", Map.of(
-                    "game", new GameDTO(game),
-                    "player", game.getWhite()
-            ));
+            sendMessage(session, "SELF_JOIN", joinPayload(game, st, player, st.blackToken));
+            sendMessage(game.getWhiteSession(), "OPPONENT_JOINED", joinPayload(game, st, game.getWhite(), null));
 
             logger.info("Game " + gameId + " is now full with black player: " + userName);
             logGameState();
@@ -214,16 +267,47 @@ public class GameController extends TextWebSocketHandler {
             return;
         }
 
-        // Remember how the game ended so a later disconnect is not treated as a resignation.
-        if (payload.path("checkmate").asBoolean(false)) {
-            game.setStatus(GameStatus.CHECKMATE);
-            game.setWinner(fromWhite ? game.getWhite() : game.getBlack());
-        } else if (payload.path("stalemate").asBoolean(false)) {
-            game.setStatus(GameStatus.STALEMATE);
-        }
+        GameState st = states.get(game.getGameId());
+        if (st == null) return;
 
-        WebSocketSession opponent = fromWhite ? game.getBlackSession() : game.getWhiteSession();
-        sendMessage(opponent, "OPPONENT_MOVE", payload);
+        synchronized (st) {
+            if (game.getStatus() != GameStatus.IN_PROGRESS) return;
+            String color = fromWhite ? "white" : "black";
+            long now = System.currentTimeMillis();
+
+            if (st.timed() && st.running) {
+                long left = (fromWhite ? st.whiteMs : st.blackMs) - (now - st.lastTick);
+                if (left <= 0) {
+                    timeUp(game, st, color);
+                    return;
+                }
+                if (fromWhite) st.whiteMs = left + st.incMs;
+                else st.blackMs = left + st.incMs;
+            }
+
+            st.moves.add(payload.deepCopy());
+
+            // Remember how the game ended so a later disconnect is not treated as a resignation.
+            if (payload.path("checkmate").asBoolean(false)) {
+                game.setStatus(GameStatus.CHECKMATE);
+                game.setWinner(fromWhite ? game.getWhite() : game.getBlack());
+                stopClock(st);
+            } else if (payload.path("stalemate").asBoolean(false)) {
+                game.setStatus(GameStatus.STALEMATE);
+                stopClock(st);
+            } else if (st.timed() && st.moves.size() >= 2) {
+                // The clocks start once both players have made their first move.
+                st.running = true;
+                st.lastTick = now;
+                armFlag(game, st);
+            }
+
+            Map<String, Object> clock = clockJson(st);
+            ObjectNode relay = payload.deepCopy();
+            relay.set("clock", objectMapper.valueToTree(clock));
+            sendMessage(session, "MOVE_ACK", Map.of("clock", clock));
+            sendMessage(fromWhite ? game.getBlackSession() : game.getWhiteSession(), "OPPONENT_MOVE", relay);
+        }
     }
 
     /** Legacy protocol: the client sends the whole game. Kept for old clients. */
@@ -285,6 +369,7 @@ public class GameController extends TextWebSocketHandler {
         Player winner = isWhite(game, session) ? game.getBlack() : game.getWhite();
         game.setStatus(GameStatus.RESIGNED);
         game.setWinner(winner);
+        stopClock(states.get(game.getGameId()));
         logger.info("Game {} ended by resignation. Winner: {}", game.getGameId(), winner.getName());
         sendMessage(opponentSession(game, session), "OPPONENT_RESIGNED", Map.of("winner", winner.getColor()));
     }
@@ -302,6 +387,7 @@ public class GameController extends TextWebSocketHandler {
         boolean accepted = payload.path("accept").asBoolean(false);
         if (accepted) {
             game.setStatus(GameStatus.DRAW);
+            stopClock(states.get(game.getGameId()));
             logger.info("Game {} drawn by agreement", game.getGameId());
         }
         sendMessage(opponentSession(game, session), accepted ? "DRAW_ACCEPTED" : "DRAW_DECLINED", Map.of("ok", accepted));
@@ -311,6 +397,7 @@ public class GameController extends TextWebSocketHandler {
     private void leave(WebSocketSession session, JsonNode payload) throws IOException {
         Game game = gameOf(session, payload);
         if (game == null) return;
+        GameState st = states.get(game.getGameId());
 
         boolean white = isWhite(game, session);
         WebSocketSession other = opponentSession(game, session);
@@ -322,18 +409,240 @@ public class GameController extends TextWebSocketHandler {
 
         if (other == null || !other.isOpen()) {
             // Nobody left in the game (or nobody ever joined): drop it.
-            games.remove(game.getGameId());
             if (other != null) sessionsWithGame.remove(other.getId());
+            removeGame(game.getGameId());
             logger.info("Game {} removed after leave", game.getGameId());
             return;
         }
 
-        // Leaving a game in progress counts as a resignation.
-        if (game.getStatus() == GameStatus.IN_PROGRESS && winner != null) {
-            game.setStatus(GameStatus.RESIGNED);
-            game.setWinner(winner);
-            sendMessage(other, "OPPONENT_LEFT", Map.of("winner", winner.getColor()));
+        if (st != null) {
+            synchronized (st) {
+                // Leaving a game in progress counts as a resignation.
+                if (game.getStatus() == GameStatus.IN_PROGRESS && winner != null) {
+                    game.setStatus(GameStatus.RESIGNED);
+                    game.setWinner(winner);
+                    stopClock(st);
+                    sendMessage(other, "OPPONENT_LEFT", Map.of("winner", winner.getColor()));
+                } else if (game.getStatus() != GameStatus.WAITING_FOR_PLAYER) {
+                    sendMessage(other, "OPPONENT_GONE", Map.of("gone", true));
+                }
+            }
         }
+    }
+
+    // ---- Rejoin, rematch, clocks --------------------------------------------
+
+    private void rejoin(WebSocketSession session, JsonNode payload) throws IOException {
+        String gameId = payload.path("gameId").asText("");
+        String token = payload.path("token").asText("");
+        Game game = findGameById(gameId);
+        GameState st = states.get(gameId);
+        if (game == null || st == null || token.isEmpty()) {
+            sendMessage(session, "REJOIN_FAILED", Map.of("gameId", gameId));
+            return;
+        }
+
+        synchronized (st) {
+            boolean white = token.equals(st.whiteToken);
+            boolean black = !white && token.equals(st.blackToken) && game.getBlack() != null;
+            if (!white && !black) {
+                sendMessage(session, "REJOIN_FAILED", Map.of("gameId", gameId));
+                return;
+            }
+
+            WebSocketSession old = white ? game.getWhiteSession() : game.getBlackSession();
+            if (white) {
+                game.setWhiteSession(session);
+                if (st.graceWhite != null) { st.graceWhite.cancel(false); st.graceWhite = null; }
+            } else {
+                game.setBlackSession(session);
+                if (st.graceBlack != null) { st.graceBlack.cancel(false); st.graceBlack = null; }
+            }
+            sessionsWithGame.put(session.getId(), gameId);
+            if (old != null && old != session && old.isOpen()) {
+                try { old.close(); } catch (IOException ignored) { }
+            }
+
+            Player me = white ? game.getWhite() : game.getBlack();
+            WebSocketSession other = white ? game.getBlackSession() : game.getWhiteSession();
+            boolean otherAway = game.getBlack() != null && (other == null || !other.isOpen());
+
+            Map<String, Object> out = joinPayload(game, st, me, token);
+            out.put("moves", st.moves);
+            out.put("opponentAway", otherAway);
+            out.put("winner", game.getWinner() != null ? game.getWinner().getColor() : null);
+            out.put("rematchOffered", white ? st.blackRematch : st.whiteRematch);
+            sendMessage(session, "REJOINED", out);
+            if (!otherAway) sendMessage(other, "OPPONENT_BACK", Map.of("back", true));
+            logger.info("Player rejoined game {} as {}", gameId, me.getColor());
+        }
+    }
+
+    private void rematch(WebSocketSession session, JsonNode payload) throws IOException {
+        Game game = gameOf(session, payload);
+        if (game == null) return;
+        GameState st = states.get(game.getGameId());
+        if (st == null) return;
+
+        synchronized (st) {
+            GameStatus status = game.getStatus();
+            if (game.getBlack() == null || status == GameStatus.IN_PROGRESS || status == GameStatus.WAITING_FOR_PLAYER) return;
+
+            boolean white = isWhite(game, session);
+            if (white) st.whiteRematch = true; else st.blackRematch = true;
+            boolean otherWants = white ? st.blackRematch : st.whiteRematch;
+            if (!otherWants) {
+                sendMessage(opponentSession(game, session), "REMATCH_OFFERED", Map.of("offered", true));
+                return;
+            }
+
+            // Both agreed: swap colours and start over.
+            Player w = game.getWhite();
+            Player b = game.getBlack();
+            WebSocketSession ws = game.getWhiteSession();
+            WebSocketSession bs = game.getBlackSession();
+            String wt = st.whiteToken;
+            st.whiteToken = st.blackToken;
+            st.blackToken = wt;
+            w.setColor("black");
+            b.setColor("white");
+            game.setWhite(b);
+            game.setBlack(w);
+            game.setWhiteSession(bs);
+            game.setBlackSession(ws);
+
+            game.setBoard(boardService.initialiseBoard());
+            game.setHistory(new History());
+            game.setStatus(GameStatus.IN_PROGRESS);
+            game.setWinner(null);
+            game.setCurrentTurn(b);
+            game.setCheck(false);
+            game.setCheckmate(false);
+            game.setStalemate(false);
+            game.setStartedAt(Instant.now());
+            st.moves.clear();
+            st.whiteRematch = false;
+            st.blackRematch = false;
+            st.resetClock();
+
+            sendMessage(game.getWhiteSession(), "REMATCH_STARTED", joinPayload(game, st, game.getWhite(), st.whiteToken));
+            sendMessage(game.getBlackSession(), "REMATCH_STARTED", joinPayload(game, st, game.getBlack(), st.blackToken));
+            logger.info("Rematch started in game {}", game.getGameId());
+        }
+    }
+
+    private Map<String, Object> joinPayload(Game game, GameState st, Player player, String token) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("game", new GameDTO(game));
+        out.put("player", player);
+        if (token != null) out.put("token", token);
+        out.put("timeControl", Map.of("base", st.baseMs / 1000, "inc", st.incMs / 1000));
+        out.put("clock", clockJson(st));
+        return out;
+    }
+
+    /** Remaining time for each side as of now; the running side's time is already reduced. */
+    private Map<String, Object> clockJson(GameState st) {
+        long w = st.whiteMs;
+        long b = st.blackMs;
+        String turn = null;
+        if (st.timed() && st.running) {
+            long elapsed = System.currentTimeMillis() - st.lastTick;
+            turn = st.turn();
+            if (turn.equals("white")) w = Math.max(0, w - elapsed);
+            else b = Math.max(0, b - elapsed);
+        }
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("whiteMs", w);
+        out.put("blackMs", b);
+        out.put("turn", turn);
+        return out;
+    }
+
+    private void stopClock(GameState st) {
+        if (st == null) return;
+        synchronized (st) {
+            st.running = false;
+            if (st.flag != null) { st.flag.cancel(false); st.flag = null; }
+        }
+    }
+
+    /** Schedules the moment the side to move runs out of time. */
+    private void armFlag(Game game, GameState st) {
+        if (st.flag != null) st.flag.cancel(false);
+        final String color = st.turn();
+        final int plies = st.moves.size();
+        long left = color.equals("white") ? st.whiteMs : st.blackMs;
+        st.flag = scheduler.schedule(() -> {
+            synchronized (st) {
+                if (game.getStatus() == GameStatus.IN_PROGRESS && st.running && st.moves.size() == plies) {
+                    try { timeUp(game, st, color); } catch (IOException e) { logger.error("timeUp failed", e); }
+                }
+            }
+        }, Math.max(left, 0) + 30, TimeUnit.MILLISECONDS);
+    }
+
+    private void timeUp(Game game, GameState st, String loserColor) throws IOException {
+        Player winner = loserColor.equals("white") ? game.getBlack() : game.getWhite();
+        game.setStatus(GameStatus.TIMEOUT);
+        game.setWinner(winner);
+        stopClock(st);
+        if (loserColor.equals("white")) st.whiteMs = 0; else st.blackMs = 0;
+        logger.info("Game {} ended on time. Winner: {}", game.getGameId(), winner.getColor());
+        Map<String, Object> msg = Map.of("winner", winner.getColor(), "clock", clockJson(st));
+        sendMessage(game.getWhiteSession(), "TIME_UP", msg);
+        sendMessage(game.getBlackSession(), "TIME_UP", msg);
+    }
+
+    /** A player has been gone past the grace period. */
+    private void graceExpired(String gameId, String color) {
+        Game game = findGameById(gameId);
+        GameState st = states.get(gameId);
+        if (game == null || st == null) return;
+        try {
+            synchronized (st) {
+                boolean white = color.equals("white");
+                WebSocketSession mine = white ? game.getWhiteSession() : game.getBlackSession();
+                if (mine != null) return; // they came back
+                WebSocketSession other = white ? game.getBlackSession() : game.getWhiteSession();
+                if (other == null || !other.isOpen()) {
+                    removeGame(gameId);
+                    return;
+                }
+                if (game.getStatus() == GameStatus.IN_PROGRESS) {
+                    Player winner = white ? game.getBlack() : game.getWhite();
+                    game.setStatus(GameStatus.RESIGNED);
+                    game.setWinner(winner);
+                    stopClock(st);
+                    sendMessage(other, "OPPONENT_LEFT", Map.of("winner", winner.getColor()));
+                } else {
+                    sendMessage(other, "OPPONENT_GONE", Map.of("gone", true));
+                }
+            }
+        } catch (IOException e) {
+            logger.error("graceExpired failed for {}", gameId, e);
+        }
+    }
+
+    private void removeGame(String gameId) {
+        games.remove(gameId);
+        GameState st = states.remove(gameId);
+        if (st != null) {
+            synchronized (st) {
+                if (st.flag != null) st.flag.cancel(false);
+                if (st.graceWhite != null) st.graceWhite.cancel(false);
+                if (st.graceBlack != null) st.graceBlack.cancel(false);
+            }
+        }
+        sessionsWithGame.entrySet().removeIf(e -> gameId.equals(e.getValue()));
+    }
+
+    private static String newToken() {
+        return UUID.randomUUID().toString().replace("-", "");
+    }
+
+    private static long clamp(long v, long lo, long hi) {
+        return Math.max(lo, Math.min(hi, v));
     }
 
     private Game findGameById(String id) {
@@ -376,77 +685,34 @@ public class GameController extends TextWebSocketHandler {
     public void afterConnectionClosed(WebSocketSession session, CloseStatus status) throws Exception {
         try {
             String sessionId = session.getId();
-            logger.info("Client disconnected: {} with status: {} (code: {}, reason: {})", 
-                       sessionId, status.getCode(), status.getCode(), status.getReason());
-            
+            logger.info("Client disconnected: {} (code: {}, reason: {})", sessionId, status.getCode(), status.getReason());
+
             String gameId = sessionsWithGame.remove(sessionId);
-            logger.info("Game ID for disconnected session: {}", gameId);
-            
-            if (gameId == null) {
-                logger.info("No game associated with session: {}", sessionId);
-                return;
-            }
+            if (gameId == null) return;
 
             Game game = findGameById(gameId);
-            if (game == null) {
-                logger.info("Game not found for ID: {}", gameId);
-                return;
-            }
+            GameState st = states.get(gameId);
+            if (game == null || st == null) return;
 
-            boolean isWhite = game.getWhiteSession() != null && sessionId.equals(game.getWhiteSession().getId());
-            boolean isBlack = game.getBlackSession() != null && sessionId.equals(game.getBlackSession().getId());
+            synchronized (st) {
+                boolean white = isWhite(game, session);
+                boolean black = isBlack(game, session);
+                if (!white && !black) return; // an old connection that was already replaced
 
-            if (!isWhite && !isBlack) {
-                logger.info("Session not associated with any player in game: {}", gameId);
-                return;
-            }
+                String color = white ? "white" : "black";
+                if (white) game.setWhiteSession(null);
+                else game.setBlackSession(null);
 
-            // Mark session as disconnected
-            if (isWhite) {
-                game.setWhiteSession(null);
-                logger.info("White player disconnected from game: {}", gameId);
-            }
-            if (isBlack) {
-                game.setBlackSession(null);
-                logger.info("Black player disconnected from game: {}", gameId);
-            }
+                // Give the player a chance to come back (page refresh, network blip).
+                ScheduledFuture<?> grace = scheduler.schedule(() -> graceExpired(gameId, color), graceMs, TimeUnit.MILLISECONDS);
+                ScheduledFuture<?> previous;
+                if (white) { previous = st.graceWhite; st.graceWhite = grace; }
+                else { previous = st.graceBlack; st.graceBlack = grace; }
+                if (previous != null) previous.cancel(false);
 
-            // Check if both players have disconnected
-            if (game.getWhiteSession() == null && game.getBlackSession() == null) {
-                logger.info("Both players disconnected, removing game: {}", gameId);
-                logger.info("Before removal - Games count: {}", games.size());
-                games.remove(gameId);
-                logger.info("After removal - Games count: {}", games.size());
-                
-                // Clean up any remaining session references for this game
-                final int[] removedSessions = {0};
-                sessionsWithGame.entrySet().removeIf(entry -> {
-                    boolean shouldRemove = gameId.equals(entry.getValue());
-                    if (shouldRemove) removedSessions[0]++;
-                    return shouldRemove;
-                });
-                logger.info("Removed {} session references for game: {}", removedSessions[0], gameId);
-                
-                // Log the current state after cleanup
-                logGameState();
-                return; // Exit early since game is removed
-            }
-
-            // If only one player disconnected and there's a winner, handle resignation
-            Player winner = isWhite ? game.getBlack() : game.getWhite();
-            WebSocketSession winnerSession = isWhite ? game.getBlackSession() : game.getWhiteSession();
-
-            // Only if no winner has already been set and there's still an active opponent
-            if (game.getWinner() == null && winner != null && winnerSession != null && winnerSession.isOpen()) {
-                game.setStatus(GameStatus.RESIGNED);
-                game.setWinner(winner);
-                logger.info("Game ended by resignation. Winner: {}", winner.toString());
-
-                try {
-                    sendMessage(winnerSession, "OPPONENT_LEFT", Map.of("winner", winner.getColor()));
-                    sessionsWithGame.remove(winnerSession.getId());
-                } catch (IOException e) {
-                    logger.error("Failed to send game end message to winner session: {}", winnerSession.getId(), e);
+                WebSocketSession other = white ? game.getBlackSession() : game.getWhiteSession();
+                if (other != null && other.isOpen() && game.getStatus() == GameStatus.IN_PROGRESS) {
+                    sendMessage(other, "OPPONENT_AWAY", Map.of("graceMs", graceMs));
                 }
             }
         } catch (Exception e) {
