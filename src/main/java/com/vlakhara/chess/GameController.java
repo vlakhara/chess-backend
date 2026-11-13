@@ -295,8 +295,9 @@ public class GameController extends TextWebSocketHandler {
             } else if (payload.path("stalemate").asBoolean(false)) {
                 game.setStatus(GameStatus.STALEMATE);
                 stopClock(st);
-            } else if (st.timed() && st.moves.size() >= 2) {
-                // The clocks start once both players have made their first move.
+            } else if (st.timed() && st.moves.size() >= 1) {
+                // The clock starts with White's first move: from then on it is always
+                // running for the side to move.
                 st.running = true;
                 st.lastTick = now;
                 armFlag(game, st);
