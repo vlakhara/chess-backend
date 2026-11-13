@@ -1,5 +1,7 @@
 package com.vlakhara.chess.entity;
 
+import com.fasterxml.jackson.annotation.JsonProperty;
+
 
 import com.vlakhara.chess.enums.PieceType;
 
@@ -57,18 +59,22 @@ public class Move {
         this.capturedPiece = capturedPiece;
     }
 
+    @JsonProperty("isPromoted")
     public Boolean getPromoted() {
         return isPromoted;
     }
 
+    @JsonProperty("isPromoted")
     public void setPromoted(Boolean promoted) {
         isPromoted = promoted;
     }
 
+    @JsonProperty("isCastle")
     public Boolean getCastle() {
         return isCastle;
     }
 
+    @JsonProperty("isCastle")
     public void setCastle(Boolean castle) {
         isCastle = castle;
     }
