@@ -67,7 +67,12 @@ public class GameController extends TextWebSocketHandler {
                 GameType type = GameType.valueOf(rawType.toUpperCase());
                 switch (type) {
                     case MOVE:
-                        move(payload);
+                        move(session, payload);
+                        break;
+                    case PING:
+                        // Heartbeat from the client: keeps the connection from
+                        // going idle and lets the client measure round-trip time.
+                        sendMessage(session, "PONG", Map.of("t", payload.path("t").asLong(0)));
                         break;
                     case CHAT:
                         logger.info("CHAT message received from session {}", session.getId());
@@ -174,7 +179,46 @@ public class GameController extends TextWebSocketHandler {
         }
     }
 
-    private void move(JsonNode payload) throws IOException {
+    /**
+     * Relays a move to the opponent. The client sends only the move (a few
+     * hundred bytes) and the opponent replays it, so the server does no heavy
+     * (de)serialisation of the whole game on every move.
+     */
+    private void move(WebSocketSession session, JsonNode payload) throws IOException {
+        if (payload.has("game")) {
+            moveLegacy(payload);
+            return;
+        }
+
+        Game game = findGameById(payload.path("gameId").asText(""));
+        if (game == null) {
+            logger.warn("MOVE for unknown game from session {}", session.getId());
+            return;
+        }
+
+        boolean fromWhite = game.getWhiteSession() != null
+                && session.getId().equals(game.getWhiteSession().getId());
+        boolean fromBlack = game.getBlackSession() != null
+                && session.getId().equals(game.getBlackSession().getId());
+        if (!fromWhite && !fromBlack) {
+            logger.warn("MOVE from a session that is not a player in game {}", game.getGameId());
+            return;
+        }
+
+        // Remember how the game ended so a later disconnect is not treated as a resignation.
+        if (payload.path("checkmate").asBoolean(false)) {
+            game.setStatus(GameStatus.CHECKMATE);
+            game.setWinner(fromWhite ? game.getWhite() : game.getBlack());
+        } else if (payload.path("stalemate").asBoolean(false)) {
+            game.setStatus(GameStatus.STALEMATE);
+        }
+
+        WebSocketSession opponent = fromWhite ? game.getBlackSession() : game.getWhiteSession();
+        sendMessage(opponent, "OPPONENT_MOVE", payload);
+    }
+
+    /** Legacy protocol: the client sends the whole game. Kept for old clients. */
+    private void moveLegacy(JsonNode payload) throws IOException {
         Game game = objectMapper.treeToValue(payload.get("game"), Game.class);
         Game _game = findGameById(game.getGameId());
         if (_game == null) {
@@ -311,7 +355,7 @@ public class GameController extends TextWebSocketHandler {
                 logger.info("Game ended by resignation. Winner: {}", winner.toString());
 
                 try {
-                    sendMessage(winnerSession, "MOVED", Map.of("game", new GameDTO(game)));
+                    sendMessage(winnerSession, "OPPONENT_LEFT", Map.of("winner", winner.getColor()));
                     sessionsWithGame.remove(winnerSession.getId());
                 } catch (IOException e) {
                     logger.error("Failed to send game end message to winner session: {}", winnerSession.getId(), e);
