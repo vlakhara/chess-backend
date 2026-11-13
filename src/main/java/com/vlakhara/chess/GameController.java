@@ -78,7 +78,16 @@ public class GameController extends TextWebSocketHandler {
                         logger.info("CHAT message received from session {}", session.getId());
                         break;
                     case RESIGN:
-                        logger.info("RESIGN message received from session {}", session.getId());
+                        resign(session, payload);
+                        break;
+                    case DRAW_OFFER:
+                        drawOffer(session, payload);
+                        break;
+                    case DRAW_RESPONSE:
+                        drawResponse(session, payload);
+                        break;
+                    case LEAVE:
+                        leave(session, payload);
                         break;
                     case JOIN:
                         join(session, payload);
@@ -246,6 +255,85 @@ public class GameController extends TextWebSocketHandler {
         sendMessage(session, "MOVED", Map.of(
                 "game", game
         ));
+    }
+
+    // ---- Game flow: resign, draw and leave --------------------------------
+
+    /** The game this session is playing in, or null if it is not a player in it. */
+    private Game gameOf(WebSocketSession session, JsonNode payload) {
+        Game game = findGameById(payload.path("gameId").asText(""));
+        if (game == null) return null;
+        return isWhite(game, session) || isBlack(game, session) ? game : null;
+    }
+
+    private boolean isWhite(Game game, WebSocketSession session) {
+        return game.getWhiteSession() != null && session.getId().equals(game.getWhiteSession().getId());
+    }
+
+    private boolean isBlack(Game game, WebSocketSession session) {
+        return game.getBlackSession() != null && session.getId().equals(game.getBlackSession().getId());
+    }
+
+    private WebSocketSession opponentSession(Game game, WebSocketSession session) {
+        return isWhite(game, session) ? game.getBlackSession() : game.getWhiteSession();
+    }
+
+    private void resign(WebSocketSession session, JsonNode payload) throws IOException {
+        Game game = gameOf(session, payload);
+        if (game == null || game.getStatus() != GameStatus.IN_PROGRESS) return;
+
+        Player winner = isWhite(game, session) ? game.getBlack() : game.getWhite();
+        game.setStatus(GameStatus.RESIGNED);
+        game.setWinner(winner);
+        logger.info("Game {} ended by resignation. Winner: {}", game.getGameId(), winner.getName());
+        sendMessage(opponentSession(game, session), "OPPONENT_RESIGNED", Map.of("winner", winner.getColor()));
+    }
+
+    private void drawOffer(WebSocketSession session, JsonNode payload) throws IOException {
+        Game game = gameOf(session, payload);
+        if (game == null || game.getStatus() != GameStatus.IN_PROGRESS) return;
+        sendMessage(opponentSession(game, session), "DRAW_OFFERED", Map.of("offered", true));
+    }
+
+    private void drawResponse(WebSocketSession session, JsonNode payload) throws IOException {
+        Game game = gameOf(session, payload);
+        if (game == null || game.getStatus() != GameStatus.IN_PROGRESS) return;
+
+        boolean accepted = payload.path("accept").asBoolean(false);
+        if (accepted) {
+            game.setStatus(GameStatus.DRAW);
+            logger.info("Game {} drawn by agreement", game.getGameId());
+        }
+        sendMessage(opponentSession(game, session), accepted ? "DRAW_ACCEPTED" : "DRAW_DECLINED", Map.of("ok", accepted));
+    }
+
+    /** A player leaves the game for good (Exit button or cancelling the wait). */
+    private void leave(WebSocketSession session, JsonNode payload) throws IOException {
+        Game game = gameOf(session, payload);
+        if (game == null) return;
+
+        boolean white = isWhite(game, session);
+        WebSocketSession other = opponentSession(game, session);
+        Player winner = white ? game.getBlack() : game.getWhite();
+
+        sessionsWithGame.remove(session.getId());
+        if (white) game.setWhiteSession(null);
+        else game.setBlackSession(null);
+
+        if (other == null || !other.isOpen()) {
+            // Nobody left in the game (or nobody ever joined): drop it.
+            games.remove(game.getGameId());
+            if (other != null) sessionsWithGame.remove(other.getId());
+            logger.info("Game {} removed after leave", game.getGameId());
+            return;
+        }
+
+        // Leaving a game in progress counts as a resignation.
+        if (game.getStatus() == GameStatus.IN_PROGRESS && winner != null) {
+            game.setStatus(GameStatus.RESIGNED);
+            game.setWinner(winner);
+            sendMessage(other, "OPPONENT_LEFT", Map.of("winner", winner.getColor()));
+        }
     }
 
     private Game findGameById(String id) {

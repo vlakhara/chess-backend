@@ -5,5 +5,8 @@ public enum GameType {
     CHAT,
     RESIGN,
     JOIN,
-    PING
+    PING,
+    DRAW_OFFER,
+    DRAW_RESPONSE,
+    LEAVE
 }
