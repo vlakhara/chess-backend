@@ -177,11 +177,27 @@ public class GameController extends TextWebSocketHandler {
     private void move(JsonNode payload) throws IOException {
         Game game = objectMapper.treeToValue(payload.get("game"), Game.class);
         Game _game = findGameById(game.getGameId());
+        if (_game == null) {
+            logger.warn("MOVE for unknown game {}", game.getGameId());
+            return;
+        }
         if(game.isStalemate()) {
             game.setStatus(GameStatus.STALEMATE);
         } else if (game.isCheckmate()) {
             game.setStatus(GameStatus.CHECKMATE);
         }
+
+        // Keep the server's copy in step with the latest move. Without this the
+        // stored game stayed at the starting position, so a later "opponent left"
+        // message reset the winner's board.
+        _game.setBoard(game.getBoard());
+        _game.setHistory(game.getHistory());
+        _game.setCurrentTurn(game.getCurrentTurn());
+        _game.setCheck(game.isCheck());
+        _game.setCheckmate(game.isCheckmate());
+        _game.setStalemate(game.isStalemate());
+        _game.setStatus(game.getStatus());
+        _game.setWinner(game.getWinner());
         WebSocketSession session = game.getCurrentTurn().getColor().equals("white") ? _game.getWhiteSession() : _game.getBlackSession();
         sendMessage(session, "MOVED", Map.of(
                 "game", game
